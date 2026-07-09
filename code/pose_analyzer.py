@@ -145,6 +145,7 @@ class JointAngles:
     trunk_angle: Optional[float] = None
     ankle_left: Optional[float] = None
     ankle_right: Optional[float] = None
+    spread_state: Optional[float] = None  # 开合跳肢体展开度 0.0(闭合) ~ 1.0(展开)
 
     def mean_symmetric(self, attr: str) -> Optional[float]:
         """取左右侧均值."""
@@ -168,7 +169,7 @@ class JointAngles:
             "俯卧撑":     self.mean_symmetric("elbow"),
             "平板支撑":   self.mean_symmetric("elbow"),
             "卷腹":       self.trunk_angle,
-            "开合跳":     None,  # 开合跳用肢体展开状态
+            "开合跳":     self.spread_state * 100.0 if self.spread_state is not None else None,  # 开合跳展开度缩放到 0-100°
             "引体向上":   self.mean_symmetric("elbow"),
             "臀桥":       self.mean_symmetric("hip"),
             "高抬腿":     self.mean_symmetric("hip"),
@@ -332,8 +333,58 @@ class JointAngleExtractor:
         angles.ankle_left  = self._ankle_vertical_angle(keypoints, confidences, "left")
         angles.ankle_right = self._ankle_vertical_angle(keypoints, confidences, "right")
         angles.trunk_angle = self._trunk_vertical_angle(keypoints, confidences)
+        angles.spread_state = self._compute_spread_state(keypoints, confidences, angles)
 
         return angles
+
+    def _compute_spread_state(self, keypoints, confidences, angles: JointAngles) -> float:
+        """计算开合跳肢体展开度 (0.0=闭合, 1.0=展开).
+
+        使用像素距离而非关节角度 — 2D 摄像头中像素距离动态范围更大、噪声更低:
+        - 手臂: 手腕相对肩膀的高度差 (像素) / 躯干高度 (像素)
+        - 腿部: 双脚踝间距 / 肩宽
+        """
+        # 参考长度: 躯干高度 (肩中点到髋中点)
+        torso_height = 100.0
+        if (valid_point(keypoints, confidences, 5) and
+                valid_point(keypoints, confidences, 6) and
+                valid_point(keypoints, confidences, 11) and
+                valid_point(keypoints, confidences, 12)):
+            shoulder_mid_y = (keypoints[5][1] + keypoints[6][1]) / 2.0
+            hip_mid_y = (keypoints[11][1] + keypoints[12][1]) / 2.0
+            torso_height = max(abs(hip_mid_y - shoulder_mid_y), 50.0)
+
+        # 1. 手臂展开: 手腕高于肩膀 → 正值, 手腕低于肩膀 → 负值
+        arm_raises = []
+        for wrist_id, shoulder_id in [(9, 5), (10, 6)]:
+            if (valid_point(keypoints, confidences, wrist_id) and
+                    valid_point(keypoints, confidences, shoulder_id)):
+                # 手腕在肩上方时为正 (像素坐标系 y 向下)
+                raise_px = float(keypoints[shoulder_id][1] - keypoints[wrist_id][1])
+                arm_raises.append(raise_px / torso_height)
+
+        if arm_raises:
+            mean_raise = float(np.mean(arm_raises))
+            # 典型范围: -0.8 (手臂下垂, 手腕在髋旁) ~ +1.0 (手臂举过头顶)
+            arm_spread = max(0.0, min(1.0, (mean_raise + 0.8) / 1.8))
+        else:
+            arm_spread = 0.0
+
+        # 2. 腿部展开: 踝距 / 肩宽
+        leg_spread = 0.0
+        if (valid_point(keypoints, confidences, 15) and
+                valid_point(keypoints, confidences, 16) and
+                valid_point(keypoints, confidences, 5) and
+                valid_point(keypoints, confidences, 6)):
+            ankle_dist = point_distance(keypoints[15], keypoints[16])
+            shoulder_width = point_distance(keypoints[5], keypoints[6])
+            if shoulder_width > 0:
+                ratio = ankle_dist / shoulder_width
+                # 典型范围: 0.7 (脚并拢) ~ 2.0 (脚大幅分开)
+                leg_spread = max(0.0, min(1.0, (ratio - 0.7) / 1.3))
+
+        # 综合: 手臂占 60%, 腿部占 40%
+        return round(0.6 * arm_spread + 0.4 * leg_spread, 3)
 
     def _joint_angle(self, keypoints, confidences, joint_name: str,
                      side: str) -> Optional[float]:
@@ -526,9 +577,9 @@ EXERCISE_STANDARDS: dict[str, ExerciseStandard] = {
         name="开合跳",
         primary_joint="spread_state",
         target_low=0.0,
-        target_high=1.0,
-        low_range=(-0.1, 0.3),
-        high_range=(0.7, 1.1),
+        target_high=100.0,
+        low_range=(-10.0, 65.0),    # 闭合: spread_angle ≤ 65° (超宽, 适配所有体型)
+        high_range=(30.0, 110.0),   # 展开: spread_angle ≥ 30° (与闭合大重叠度, if-elif 保证不会误触发)
         count_trigger="high",
         trunk_max=25.0,
         symmetry_joints=("elbow", "knee"),
@@ -821,12 +872,12 @@ class MovementScorer:
     def _score_temporal(self, temporal: TemporalFeatures) -> float:
         """时序一致性得分 (0-30).
 
-        - 节奏稳定性: 15分, CV < 15% 得满分. CV=0 且无 rep 数据时不给满分.
+        - 节奏稳定性: 15分, CV < 35% 得满分. CV=0 且无 rep 数据时不给满分.
         - 动作平滑度: 15分, jerk 线性映射.
         """
-        # CV=0 可能是无数据, 取不低于 0.03 避免未运动就得满分
-        effective_cv = max(temporal.rhythm_consistency, 0.03)
-        rhythm_score = 15.0 * max(0.0, 1.0 - effective_cv / 0.20)
+        # CV=0 可能是无数据, 取不低于 0.015 避免未运动就得满分
+        effective_cv = max(temporal.rhythm_consistency, 0.015)
+        rhythm_score = 15.0 * max(0.0, 1.0 - effective_cv / 0.35)
         smooth_score = 15.0 * max(0.0, 1.0 - temporal.smoothness / 50.0)
         return rhythm_score + smooth_score
 
@@ -1257,6 +1308,9 @@ class PoseAnalyzer:
         self._session_start_time: Optional[float] = None  # 首次进入运动相位的时间
         self._session_active: bool = False
 
+        # 主角度 EMA 预平滑 (用于时序特征提取, 降低快速动作的 jerk 噪声)
+        self._smooth_primary_val: Optional[float] = None
+
     @property
     def scorer(self) -> MovementScorer:
         """公开 MovementScorer 实例，供 DiagnosticContextBuilder 读取诊断数据."""
@@ -1295,8 +1349,18 @@ class PoseAnalyzer:
         # 3. 相位检测与计数
         self._update_phase_and_count(angles, primary_val)
 
-        # 4. 时序特征
-        temporal = self._temporal_extractor.update(primary_val, self.phase)
+        # 4. 时序特征 — 使用 EMA 平滑角度, 降低快速动作 (如开合跳) 的 jerk 噪声
+        if primary_val is not None:
+            if self._smooth_primary_val is None:
+                self._smooth_primary_val = float(primary_val)
+            else:
+                # alpha=0.7: 更快响应, 减少预热期 lag 导致的初始分数虚高
+                self._smooth_primary_val = (0.7 * float(primary_val)
+                                            + 0.3 * self._smooth_primary_val)
+            temporal_val = self._smooth_primary_val
+        else:
+            temporal_val = None
+        temporal = self._temporal_extractor.update(temporal_val, self.phase)
 
         # 5. 错误检测
         errors = self._error_detector.detect(angles, keypoints, confidences,
@@ -1418,6 +1482,7 @@ class PoseAnalyzer:
         self.hold_time = 0.0
         self._session_start_time = None
         self._session_active = False
+        self._smooth_primary_val = None
         self._temporal_extractor.reset()
         self._scorer.reset()
         self._error_detector.reset()

@@ -216,10 +216,12 @@ class TestJointAngleExtractor:
         for ex in all_exercises:
             val = angles.primary_angle(ex)
             if ex == "开合跳":
-                assert val is None, f"{ex} 的主角度应为 None"
+                # 开合跳使用 spread_state (缩放到 0-100°), 应返回有效值
+                assert val is not None, f"{ex} 的 spread_state 不应为 None"
+                assert 0.0 <= val <= 100.0, f"{ex} 的 spread_angle 应在 0-100, 实际 {val}"
             else:
                 # 其他动作都应返回一个值
-                assert val is not None or True, f"{ex} 返回 {val}"
+                assert val is not None, f"{ex} 返回 {val}"
 
 
 # ============================================================================
